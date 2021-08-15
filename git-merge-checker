@@ -1,0 +1,383 @@
+#!/usr/bin/env python
+# coding=utf-8
+
+import time
+from datetime import datetime
+import operator
+
+USAGE = r"""
+"""
+
+EPILOG = r"""
+"""
+
+import sys
+import re
+import subprocess
+import argparse
+
+
+if not (0x02060000 <= sys.hexversion):
+    sys.exit('Python version 2.6 or later is required')
+
+
+# Backwards compatibility:
+try:
+    from subprocess import CalledProcessError
+except ImportError:
+    # Use definition from Python 2.7 subprocess module:
+    class CalledProcessError(Exception):
+        def __init__(self, returncode, cmd, output=None):
+            self.returncode = returncode
+            self.cmd = cmd
+            self.output = output
+        def __str__(self):
+            return "Command '%s' returned non-zero exit status %d" % (self.cmd, self.returncode)
+
+try:
+    from subprocess import check_output
+except ImportError:
+    # Use definition from Python 2.7 subprocess module:
+    def check_output(*popenargs, **kwargs):
+        if 'stdout' in kwargs:
+            raise ValueError('stdout argument not allowed, it will be overridden.')
+        process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
+        output, unused_err = process.communicate()
+        retcode = process.poll()
+        if retcode:
+            cmd = kwargs.get("args")
+            if cmd is None:
+                cmd = popenargs[0]
+            try:
+                raise CalledProcessError(retcode, cmd, output=output)
+            except TypeError:
+                # Python 2.6's CalledProcessError has no 'output' kw
+                raise CalledProcessError(retcode, cmd)
+        return output
+
+
+class Failure(Exception):
+    pass
+
+
+def _decode_output(value):
+    """Decodes Git output into a unicode string.
+
+    On Python 2 this is a no-op; on Python 3 we decode the string as
+    suggested by [1] since we know that Git treats paths as just a sequence
+    of bytes and all of the output we ask Git for is expected to be a file
+    system path.
+
+    [1] http://docs.python.org/3/c-api/unicode.html#file-system-encoding
+
+    """
+    if sys.hexversion < 0x3000000:
+        return value
+    return value.decode(sys.getfilesystemencoding(), 'surrogateescape')
+
+
+def check_git_output(*popenargs, **kwargs):
+    return _decode_output(check_output(*popenargs, **kwargs))
+
+
+def iter_commit_refs():
+    """Iterate over the names of references that refer to commits.
+
+    (This includes references that refer to annotated tags that refer
+    to commits.)"""
+    process = subprocess.Popen(
+        [
+            'git', 'for-each-ref', 'refs/remotes',
+            '--format=%(objectname) %(refname:short)',
+            ],
+        stdout=subprocess.PIPE,
+        )
+    for line in process.stdout:
+        words = _decode_output(line).strip().split()
+        commit_hash, ref_name = words[0], words[1].lstrip("origin/")
+        yield commit_hash, ref_name
+
+    retcode = process.wait()
+    if retcode:
+        raise Failure('git for-each-ref failed')
+
+
+def rev_parse(arg, abbrev=None):
+    if abbrev:
+        cmd = ['git', 'rev-parse', '--verify', '-q', '--short=%d' % (abbrev,), arg]
+    else:
+        cmd = ['git', 'rev-parse', '--verify', '-q', arg]
+
+    try:
+        return check_git_output(cmd).strip()
+    except CalledProcessError:
+        raise Failure('%r is not a valid commit!' % (arg,))
+
+
+def describe(arg, contains=False):
+    cmd = ['git', 'describe']
+    if contains:
+        cmd += ['--contains']
+    cmd += [arg]
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = process.communicate()
+    retcode = process.poll()
+    if retcode:
+        return None
+    else:
+        return _decode_output(out).strip()
+
+
+def rev_list_with_parents(*args):
+    cmd = ['git', 'log', '--format=%H %P'] + list(args) + ['--']
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    for line in process.stdout:
+        words = _decode_output(line).strip().split()
+        yield (words[0], words[1:])
+
+    retcode = process.wait()
+    if retcode:
+        raise Failure('command "%s" failed' % (' '.join(cmd),))
+
+
+class CommitGraph:
+    def __init__(self, *args):
+        self.commits = dict(rev_list_with_parents(*args))
+
+    def __contains__(self, commit):
+        return commit in self.commits
+
+    def __getitem__(self, commit):
+        return self.commits[commit]
+
+    def first_parent_path(self, commit):
+        """Iterate over the commits in the first-parent ancestry of commit.
+
+        Iterate over the commits that are within this CommitGraph that
+        are also in the first-parent ancestry of the specified commit.
+        commit must be a full 40-character SHA-1.
+
+        """
+
+        while True:
+            try:
+                parents = self[commit]
+            except KeyError:
+                return
+            yield commit
+            if not parents:
+                return
+            commit = parents[0]
+
+
+class MergeNotFoundError(Exception):
+    def __init__(self, refname):
+        self.refname = refname
+
+
+class InvalidCommitError(MergeNotFoundError):
+    msg = 'Is not a valid commit!'
+
+
+class DoesNotContainCommitError(MergeNotFoundError):
+    msg = 'Does not contain commit.'
+
+
+class DirectlyOnBranchError(MergeNotFoundError):
+    msg = 'Commit is directly on this branch.'
+
+
+class MergedViaMultipleParentsError(MergeNotFoundError):
+    def __init__(self, refname, parents):
+        MergeNotFoundError.__init__(self, refname)
+        self.msg = 'Merged via multiple parents: %s' % (' '.join(parents),)
+
+
+def find_merge(commit, branch):
+    """Return the SHA-1 of the commit that merged commit into branch.
+
+    It is assumed that content is always merged in via the second or
+    subsequent parents of a merge commit."""
+
+    try:
+        branch_sha1 = rev_parse('%s^{commit}' % (branch,))
+    except Failure:
+        raise InvalidCommitError(branch)
+
+    commit_graph = CommitGraph('--ancestry-path', '%s..%s' % (commit, branch_sha1))
+
+    while True:
+        branch_commits = list(commit_graph.first_parent_path(branch_sha1))
+
+        if not branch_commits:
+            raise DoesNotContainCommitError(branch)
+
+        # The last entry in branch_commits is the one that merged in
+        # commit.
+        last = branch_commits[-1]
+        parents = commit_graph[last]
+
+        if parents[0] == commit:
+            raise DirectlyOnBranchError(branch)
+
+        yield last
+
+        if commit in parents:
+            # The commit was merged in directly:
+            return
+
+        # Find which parent(s) merged in the commit:
+        parents = [
+            parent
+            for parent in parents
+            if parent in commit_graph
+            ]
+        assert(parents)
+        if len(parents) > 1:
+            raise MergedViaMultipleParentsError(branch, parents)
+
+        [branch_sha1] = parents
+
+
+FIRST_FORMAT = '%(refname)-38s %(name)s'
+OTHER_FORMAT = FIRST_FORMAT % dict(refname='', name='via %(name)s')
+
+COMMIT_FORMAT = '%(name)s'
+BRANCH_FORMAT = '%(name)s^1..%(name)s'
+
+WARN_FORMAT = '%(refname)-38s %(msg)s'
+
+
+def main(args):
+    """
+    1. 通过传入的Jira结合feature分支正则
+    2. 获取指定feature分支的SHA-1 commit: git for-each-ref refs/remotes --format='%(objectname) %(refname:short)'
+    3. find_merge，对合入的commit进行解析，输出各个Jira对应feature分支的结果
+    :param args:
+    :return:
+    """
+    parser = argparse.ArgumentParser(
+            prog='git-merge-checker',
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            # description=__doc__,
+            usage=USAGE,
+            # epilog=EPILOG,
+        )
+
+    parser.add_argument(
+        '--jira_list', '-j', nargs='+', dest='jira_list', default=[],
+        help=(
+            'Jira Keys. For example: --jira_list SPCICD-1 SPCICD-2'
+        ),
+        required=True,
+    )
+
+    parser.add_argument(
+        '--sign_off', '-s',
+        type=lambda s: datetime.strptime(s, '%Y-%m-%d %H:%M:%S'),
+        help="Sign off time. For example: --sign_off='2021-10-10 12:00:01'"
+    )
+
+    parser.add_argument(
+        '--branch', default='HEAD',
+        help='Target Branch. Default is Head. For example: --branch=release',
+    )
+
+    options = parser.parse_args(args)
+
+    # Convert commit into a SHA-1:
+    branch_patterns_map = {}
+    branch_patterns = "^(feature|hotfix|adhoc|bugfix)/{}(-[A-Za-z0-9-]+)$"
+    refpatterns = []
+
+    for jira_key in options.jira_list:
+        try:
+            pattern = branch_patterns.format(jira_key)
+            branch_patterns_map[pattern] = jira_key
+            refpatterns.append(re.compile(pattern))
+        except re.error as e:
+            sys.stderr.write(
+                'Error compiling pattern of %r; ignoring: %s\n'
+                % (jira_key, e,)
+                )
+
+    # jira_key -> [(feature_branch, latest_sha1)]
+    feature_branches = {}
+    for jira_key in options.jira_list:
+        feature_branches[jira_key] = []
+
+    for latest_sha1, ref_name in iter_commit_refs():
+        for ref_pattern in refpatterns:
+            if ref_pattern.search(ref_name):
+                jira_key = branch_patterns_map[ref_pattern.pattern]
+                feature_branches[jira_key] = feature_branches[jira_key] + [(ref_name, latest_sha1)]
+
+    target_branch = options.branch
+
+    merged_branches = {}
+    unmerged_branches = {}
+    unexpected_branches = {}
+    for jira_key, feature_branches in feature_branches.items():
+        if not feature_branches:
+            unexpected_branches[jira_key] = u"Branch not found"
+            continue
+        elif len(feature_branches) > 1:
+            unexpected_branches[jira_key] = u"Multi feature branch? {}".format(feature_branches)
+            continue
+
+        feature_branch = feature_branches[0][0]
+        feature_branch_sha1 = feature_branches[0][1]
+        try:
+            for sha1 in find_merge(feature_branch_sha1, target_branch):
+                cmd = ['git', '--no-pager', 'log', "--format=%ad_%h_%s", "--date=format:%Y-%m-%d %H:%M:%S", '--no-walk', sha1]
+                try:
+                    t, commit, message = check_git_output(cmd).strip().split("_")
+                except CalledProcessError:
+                    raise Failure('%s git log failure!' % (sha1,))
+
+                if options.sign_off:
+                    time.mktime(options.sign_off.timetuple())
+                    sign_off_timestamp = int(time.mktime(options.sign_off.timetuple()))
+                    commit_timestamp = int(time.mktime(datetime.strptime(t, '%Y-%m-%d %H:%M:%S').timetuple()))
+                    if commit_timestamp > sign_off_timestamp:
+                        unmerged_branches[jira_key] = u"{} 未在sign_off时间内完成, 合并时间为{}".format(feature_branch, t)
+                    else:
+                        merged_branches[jira_key] = (feature_branch, t, commit, message)
+                else:
+                    merged_branches[jira_key] = (feature_branch, t, commit, message)
+                # No need show recursive now.
+                break
+
+        except DirectlyOnBranchError as e:
+            try:
+                cmd = ['git', '--no-pager', 'log', "--format=%ad_%h_%s", "--date=format:%Y-%m-%d %H:%M:%S", '--no-walk',
+                       feature_branch_sha1]
+                t, _, _ = check_git_output(cmd).strip().split("_")
+            except CalledProcessError:
+                raise Failure('%s git log failure!' % (feature_branch_sha1,))
+            unexpected_branches[jira_key] = u"{} 还没有新的提交 或者使用了不符合规范的Fast Forward合并方式合入到目标分支，合并时间晚于 {}".format(feature_branch, t)
+        except MergedViaMultipleParentsError as e:
+            unexpected_branches[jira_key] = u"{} {}".format(feature_branch, e)
+        except MergeNotFoundError as e:
+            unmerged_branches[jira_key] = u"{} 还未合并".format(feature_branch)
+        except Failure as e:
+            sys.exit('%s' % (e,))
+
+    if merged_branches:
+        print u"已合入{}的分支:".format(target_branch)
+        for branch in sorted(merged_branches.items(), key=operator.itemgetter(1), reverse=True):
+            print branch[0], merged_branches[branch[0]][2], merged_branches[branch[0]][3], "合入时间:", merged_branches[branch[0]][1]
+
+    if unmerged_branches:
+        print u"\n未合入{}的分支:".format(target_branch)
+        for jira_key, unmerged_branch in unmerged_branches.items():
+            print jira_key, unmerged_branch
+
+    if unexpected_branches:
+        print u"\n错误分支:".format(target_branch)
+        for jira_key, reason in unexpected_branches.items():
+            print jira_key, reason
+
+
+main(sys.argv[1:])
