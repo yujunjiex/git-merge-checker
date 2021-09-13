@@ -4,6 +4,7 @@ import argparse
 import re
 import subprocess
 import sys
+import time
 
 from rich.console import Console
 from rich.table import Table
@@ -291,9 +292,10 @@ def main(args):
         try:
             merged_commit = mf.find_merge(commit_hash)
             merged_commit_info = mf.commit_info(merged_commit)
+            commit_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(merged_commit_info.commit_time)))
             table.add_row(
                 branch_name, commit_hash[:8], "已合入",
-                merged_commit_info.commit_time,
+                commit_time,
                 merged_commit_info.commit_hash[:8] + " " + merged_commit_info.title,
             )
         except DirectlyOnBranchError:
