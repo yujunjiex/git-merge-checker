@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+# -*- mode: python3; coding: utf-8 -*-
+import argparse
+import re
+import subprocess
+import sys
+
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+
+if not (0x03060000 <= sys.hexversion):
+    sys.exit('Python version 3.6 or later is required')
+
+
+# Backwards compatibility:
+try:
+    from subprocess import CalledProcessError
+except ImportError:
+    # Use definition from Python 2.7 subprocess module:
+    class CalledProcessError(Exception):
+        def __init__(self, returncode, cmd, output=None):
+            self.returncode = returncode
+            self.cmd = cmd
+            self.output = output
+        def __str__(self):
+            return "Command '%s' returned non-zero exit status %d" % (self.cmd, self.returncode)
+
+try:
+    from subprocess import check_output
+except ImportError:
+    # Use definition from Python 2.7 subprocess module:
+    def check_output(*popenargs, **kwargs):
+        if 'stdout' in kwargs:
+            raise ValueError('stdout argument not allowed, it will be overridden.')
+        process = subprocess.Popen(stdout=subprocess.PIPE, *popenargs, **kwargs)
+        output, unused_err = process.communicate()
+        retcode = process.poll()
+        if retcode:
+            cmd = kwargs.get("args")
+            if cmd is None:
+                cmd = popenargs[0]
+            try:
+                raise CalledProcessError(retcode, cmd, output=output)
+            except TypeError:
+                # Python 2.6's CalledProcessError has no 'output' kw
+                raise CalledProcessError(retcode, cmd)
+        return output
+
+
+def get_current_branch():
+    cmd = ['git', 'symbolic-ref', '--short', '-q', 'HEAD']
+    try:
+        return check_git_output(cmd).strip()
+    except CalledProcessError:
+        raise Failure('fail to get current branch!')
+
+
+class Failure(Exception):
+    pass
+
+
+class MergeNotFoundError(Exception):
+    def __init__(self, refname):
+        self.refname = refname
+
+
+class InvalidCommitError(MergeNotFoundError):
+    msg = 'Is not a valid commit!'
+
+
+class DoesNotContainCommitError(MergeNotFoundError):
+    msg = 'Does not contain commit.'
+
+
+class DirectlyOnBranchError(MergeNotFoundError):
+    msg = 'Commit is directly on this branch.'
+
+
+def _decode_output(value):
+    """Decodes Git output into a unicode string.
+
+    On Python 2 this is a no-op; on Python 3 we decode the string as
+    suggested by [1] since we know that Git treats paths as just a sequence
+    of bytes and all of the output we ask Git for is expected to be a file
+    system path.
+
+    [1] http://docs.python.org/3/c-api/unicode.html#file-system-encoding
+
+    """
+    if sys.hexversion < 0x3000000:
+        return value
+    return value.decode(sys.getfilesystemencoding(), 'surrogateescape')
+
+
+def check_git_output(*popenargs, **kwargs):
+    return _decode_output(check_output(*popenargs, **kwargs))
+
+
+def rev_parse(arg, abbrev=None):
+    if abbrev:
+        cmd = ['git', 'rev-parse', '--verify', '-q', '--short=%d' % (abbrev,), arg]
+    else:
+        cmd = ['git', 'rev-parse', '--verify', '-q', arg]
+
+    try:
+        return check_git_output(cmd).strip()
+    except CalledProcessError:
+        raise Failure('%r is not a valid commit!' % (arg,))
+
+
+def rev_list_with_parents(*args):
+    commit_regex = re.compile(r"^hash:(.*) parents:(.*) committer:(.*) ctime:(.*) title:(.*)")
+
+    cmd = ['git', 'log', '--format=hash:%H parents:%P committer:%cn ctime:%at title:%s', '--date-order'] + list(args) + ['--']
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    for line in process.stdout:
+        result = re.findall(commit_regex, _decode_output(line))
+        commit_hash, parents_hash, author, commit_time, title = result[0]
+        c = Commit(commit_hash, parents_hash.strip().split(), author, commit_time, title)
+        yield c
+
+    retcode = process.wait()
+    if retcode:
+        raise Failure('command "%s" failed' % (' '.join(cmd),))
+
+
+def get_latest_commit_from_branches():
+    cmd = ['git', 'for-each-ref', 'refs/remotes', '--format=%(objectname) %(refname:short)']
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    for line in process.stdout:
+        commit_hash, origin_branch = _decode_output(line).split()
+        if origin_branch == "origin/HEAD":
+            continue
+        yield commit_hash, origin_branch.replace("origin/", "")
+
+    retcode = process.wait()
+    if retcode:
+        raise Failure('command "%s" failed' % (' '.join(cmd),))
+
+
+def find_first_commit():
+    cmd = ["git log --format='%H' --reverse | head -1"]
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    return _decode_output(process.stdout.read()).rstrip()
+
+
+class Commit:
+    def __init__(self, commit_hash, parents_hash, author, commit_time, title):
+        self.commit_hash = commit_hash
+        self.parents_hash = parents_hash
+        self.author = author
+        self.commit_time = commit_time
+        self.title = title
+
+
+class CommitGraph:
+    def __init__(self, branch_sha1):
+        self.branch_sha1 = branch_sha1
+        self.commits = {}
+        self.commits_info = {}
+        # latest commit is minimum(id = 1), first commit is the maximum
+        self._commits_order = {}
+        i = 1
+        for c in rev_list_with_parents('--ancestry-path', '%s..%s' % (find_first_commit(), branch_sha1)):
+            self.commits_info[c.commit_hash] = c
+            self.commits[c.commit_hash] = c.parents_hash
+            self._commits_order[c.commit_hash] = i
+            i += 1
+        self.cache = {}
+
+    def __contains__(self, commit):
+        return commit in self.commits
+
+    def __getitem__(self, commit):
+        return self.commits[commit]
+
+    def commit_order(self, commit):
+        return self._commits_order[commit]
+
+    def commit_info(self, commit):
+        return self.commits_info[commit]
+
+    def first_parent_path(self, target_commit):
+        """Iterate over the commits in the first-parent ancestry of commit.
+
+        Iterate over the commits that are within this CommitGraph that
+        are also in the first-parent ancestry of the specified commit.
+        commit must be a full 40-character SHA-1.
+
+        """
+        # First commit
+        if target_commit == self.branch_sha1:
+            raise DirectlyOnBranchError(self.branch_sha1)
+
+        if target_commit not in self._commits_order:
+            raise DoesNotContainCommitError(target_commit)
+
+        cur_commit = self.branch_sha1
+        while True:
+            # If commit1 ahead or same as commit2
+            if self.commit_order(cur_commit) >= self.commit_order(target_commit):
+                return
+
+            try:
+                parents = self[cur_commit]
+            except KeyError:
+                return
+
+            # ensure cur_commit at ancestry-path point
+            if self.is_parent(target_commit, cur_commit):
+                yield cur_commit
+
+            if not parents:
+                return
+            cur_commit = parents[0]
+
+    def is_parent(self, target_commit, cur_commit):
+        if cur_commit in self.cache:
+            return self.cache[cur_commit]
+        if self.commit_order(cur_commit) > self.commit_order(target_commit):
+            self.cache[cur_commit] = False
+            return False
+        if self.commit_order(cur_commit) == self.commit_order(target_commit):
+            self.cache[cur_commit] = True
+            return True
+        parents = self.commits[cur_commit]
+        if len(parents) == 2:
+            result = self.is_parent(target_commit, parents[0]) or self.is_parent(target_commit, parents[1])
+            self.cache[cur_commit] = result
+            return result
+        else:
+            result = self.is_parent(target_commit, parents[0])
+            self.cache[cur_commit] = result
+            return result
+
+
+class MergeFinder:
+    def __init__(self, branch):
+        self.branch = branch
+        try:
+            branch_sha1 = rev_parse('%s^{commit}' % (branch,))
+        except Failure:
+            raise InvalidCommitError(branch)
+
+        self.commit_graph = CommitGraph(branch_sha1)
+
+    def commit_info(self, commit_id):
+        return self.commit_graph.commit_info(commit_id)
+
+    def find_merge(self, target_commit):
+        branch_commits = list(self.commit_graph.first_parent_path(target_commit))
+
+        if not branch_commits:
+            raise DoesNotContainCommitError(self.branch)
+
+        # The last entry in branch_commits is the one that merged in
+        # commit.
+        last = branch_commits[-1]
+        parents = self.commit_graph[last]
+
+        if parents[0] == target_commit:
+            raise DirectlyOnBranchError(self.branch)
+
+        return last
+
+
+def main(args):
+    parser = argparse.ArgumentParser(
+            prog='git-merge-checker',
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+    parser.add_argument('branch', nargs="*", default=["HEAD"])
+    options = parser.parse_args(args)
+
+    target_branch = options.branch[0]
+    if target_branch == "HEAD":
+        target_branch = get_current_branch()
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("分支名")
+    table.add_column("最近一次commit")
+    table.add_column("是否合入" + target_branch)
+    table.add_column("合入时间")
+    table.add_column("合入commit")
+
+    mf = MergeFinder(target_branch)
+    for commit_hash, branch_name in get_latest_commit_from_branches():
+        # todo: branch_name match 通配符
+        try:
+            merged_commit = mf.find_merge(commit_hash)
+            merged_commit_info = mf.commit_info(merged_commit)
+            table.add_row(
+                branch_name, commit_hash[:8], "已合入",
+                merged_commit_info.commit_time,
+                merged_commit_info.commit_hash[:8] + " " + merged_commit_info.title,
+            )
+        except DirectlyOnBranchError:
+            table.add_row(
+                branch_name, commit_hash[:8], "已合入",
+                "Unknown(direct on branch)",
+                commit_hash[:8] + " " + mf.commit_info(commit_hash).title,
+            )
+        except DoesNotContainCommitError:
+            table.add_row(
+                branch_name, commit_hash[:8], "[red]未合入[/red]",
+                "-",
+                "-",
+            )
+        except (InvalidCommitError, Failure) as e:
+            raise e
+
+    console.print(table)
+
+
+main(sys.argv[1:])
