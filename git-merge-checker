@@ -111,8 +111,8 @@ def get_latest_commit_from_branches():
 
 
 def find_first_commit():
-    cmd = ["git log --format='%H' --reverse"]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    cmd = ['git', 'log', '--format=%H', '--reverse']
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     for line in process.stdout:
         return _decode_output(line).strip()
 
