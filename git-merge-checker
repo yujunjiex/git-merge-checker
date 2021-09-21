@@ -111,9 +111,10 @@ def get_latest_commit_from_branches():
 
 
 def find_first_commit():
-    cmd = ["git log --format='%H' --reverse | head -1"]
+    cmd = ["git log --format='%H' --reverse"]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
-    return _decode_output(process.stdout.read()).rstrip()
+    for line in process.stdout:
+        return _decode_output(line).strip()
 
 
 class Commit:
@@ -265,7 +266,11 @@ def main(args):
     table.add_column("合入时间")
     table.add_column("合入commit")
 
-    mf = MergeFinder(target_branch)
+    try:
+        mf = MergeFinder(target_branch)
+    except InvalidCommitError:
+        print("target branch is not exist!")
+        sys.exit(-1)
     for commit_hash, branch_name in get_latest_commit_from_branches():
         if not any_match(branch_name, options.branch):
             continue
